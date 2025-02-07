@@ -6,12 +6,12 @@ llm = ChatOpenAI(
     streaming=False,
     verbose=False,
     openai_api_key="EMPTY",
-    openai_api_base="http://0.0.0.0:20000/v1/",
+    openai_api_base="http://192.168.102.196:9998/v1/",
     model_name='Qwen2-7B-Instruct',
     temperature=0.7,
     max_tokens=28000,
 )
-
+print(llm.invoke('你好'))
 from dotenv import load_dotenv
 # 加载环境变量
 load_dotenv()
@@ -442,48 +442,197 @@ def query_data(sql_query):
         # print(json_result)
         return query_result
 
-    except Exception as e:
-        # 错误处理，例如打印错误信息或抛出异常
-        print(f"An error occurred: {e}")
+    except psycopg2.Error as e:
+        # 捕获数据库相关的错误
+        print(f"数据库错误：{e}")
         return None
+    except Exception as e:
+        # 捕获其他异常
+        print(f"发生错误：{e}")
+        return None
+
+
+def get_custom_question(model, query: str) -> dict:
+    try:
+        response_schemas = [
+            ResponseSchema(name="year", description="...")
+        ]
+        # 设置解析器等
+        output = model(query)
+        json_obj = parse_json_markdown(output.content)
+
+        year_info = json_obj.get('year', '')
+        table_info = json_obj.get('table_info', '')
+
+        # 返回解析结果
+        return str(year_info), str(table_info)
+    except Exception as e:
+        print(f"模型调用错误：{e}")
+        return '', ''  # 默认返回空值
+
 
 import pandas as pd
 import re
-df = pd.read_excel('/root/langchat_3dgis/QA.xlsx')
+import time
 
-# 定义SQL关键字的正则表达式
+# 读取文件
+try:
+    df = pd.read_excel('/root/langchat_3dgis/table/exp1/QA.xlsx')
+except Exception as e:
+    print(f"读取文件时发生错误：{e}")
+    df = pd.DataFrame()  # 返回一个空的 DataFrame，避免后续出错
+
+# SQL 关键字的正则表达式
 sql_keywords_regex = r'\b(SELECT|SUM|MIN|MAX|AS|COUNT|FROM|WHERE|JOIN|ON|GROUP BY|ORDER BY|HAVING|LIMIT)\b'
 
-# 函数：提取SQL语句中的关键字
+# 提取 SQL 语句中的关键字
 def extract_keywords(sql):
     return re.findall(sql_keywords_regex, sql, re.IGNORECASE)
 
-for index,row in df.iterrows():
-    user_query = row['自然语言查询语句']
-    print(user_query)
-    true_sql = row['对应的SQL语句']
-    question = get_custom_question(llm, user_query)
-    table_name = get_real_table_name(year=question[0], table_info=question[1], embed_func=embed_func, pg_vector=db)
-    print(f"真实表名：{table_name}")
-    field_info_list = get_field_info(table_name, db, embed_func)
-    query_type = get_type_by_question(llm, user_query)
-    get_sql_query1 = []
-    get_sql_query1 = get_sql_query(llm, user_query, query_type)
-    llm_sql = get_llm_sql(table_name, field_info_list, get_sql_query1, llm)
+# 错误处理输出对象
+class AgentOutput:
+    def __init__(self, success: bool, result=None, error=None):
+        self.success = success
+        self.result = result
+        self.error = error
 
-    print(true_sql)
-    query_result = []
-    query_result = query_data(llm_sql)
-    true_result = []
-    true_result = query_data(true_sql)
-    print(query_result)
-    print(true_result)
+# Agent 1 的实现
+def agent_1_process(model, query):
+    try:
+        year, table_info = get_custom_question(model, query)
+        if not table_info:
+            raise ValueError("未能从用户问题中提取表名信息")
+        return AgentOutput(success=True, result={"year": year, "table_info": table_info})
+    except Exception as e:
+        return AgentOutput(success=False, error=f"Agent 1 错误: {str(e)}")
+
+# Agent 2 的实现
+def agent_2_process(model, query):
+    try:
+        query_type = get_type_by_question(model, query)
+        if not query_type:
+            raise ValueError("未能从用户问题中提取查询类型")
+        return AgentOutput(success=True, result={"query_type": query_type})
+    except Exception as e:
+        return AgentOutput(success=False, error=f"Agent 2 错误: {str(e)}")
+
+# Agent 3 的实现
+def agent_3_process(model, query):
+    try:
+        count_condition = get_count_condition_by_question(model, query)
+        if not count_condition:
+            raise ValueError("未能从用户问题中提取计数条件")
+        return AgentOutput(success=True, result={"count_condition": count_condition})
+    except Exception as e:
+        return AgentOutput(success=False, error=f"Agent 3 错误: {str(e)}")
+
+# Agent 4 的实现
+def agent_4_process(model, query):
+    try:
+        query_condition = get_query_condition_by_question(model, query)
+        if not query_condition:
+            raise ValueError("未能从用户问题中提取查询条件")
+        return AgentOutput(success=True, result={"query_condition": query_condition})
+    except Exception as e:
+        return AgentOutput(success=False, error=f"Agent 4 错误: {str(e)}")
+
+# Agent 5 的实现
+def agent_5_process(model, query):
+    try:
+        sql_query = get_llm_sql(model, query)
+        if not sql_query:
+            raise ValueError("未能生成 SQL 查询")
+        return AgentOutput(success=True, result={"sql_query": sql_query})
+    except Exception as e:
+        return AgentOutput(success=False, error=f"Agent 5 错误: {str(e)}")
+
+# Agent 输出是否符合预期
+def validate_agent_output(agent_output, validation_rules):
+    if not agent_output.success:
+        return False, agent_output.error
+
+    for rule in validation_rules:
+        if not rule(agent_output.result):
+            return False, "输出未通过验证规则"
+
+    return True, None
+
+# 完整查询处理流程
+# 完整查询处理流程
+def process_query_with_agents(query, model, rollback_agent=None):
+    """
+    递归地处理每个 Agent，遇到错误时回退并重新处理前一个 Agent。
+    """
+    # Step 1: Agent 1 处理表名和年份
+    if rollback_agent is None or rollback_agent == 1:
+        agent_1_output = agent_1_process(model, query)
+        if not agent_1_output.success or not agent_1_output.result.get("table_name") or not agent_1_output.result.get("year"):
+            print(f"Agent 1 失败，错误信息: {agent_1_output.error}")
+            # 如果需要回退到上一个 Agent，可以传递参数，控制递归回退
+            return process_query_with_agents(query, model, rollback_agent=0)  # 回退至初始阶段
+
+    # Step 2: Agent 2 获取查询类型
+    if rollback_agent is None or rollback_agent == 2:
+        agent_2_output = agent_2_process(model, query)
+        if not agent_2_output.success or not agent_2_output.result.get("query_type"):
+            print(f"Agent 2 失败，错误信息: {agent_2_output.error}")
+            return process_query_with_agents(query, model, rollback_agent=0)  # 回退到 Agent 1
+
+    # Step 3: 根据查询类型调用 Agent 3 或 Agent 4
+    if rollback_agent is None or rollback_agent == 3:
+        if agent_2_output.result["query_type"] == "count":
+            agent_3_output = agent_3_process(model, query)
+            if not agent_3_output.success or not agent_3_output.result.get("conditions"):
+                print(f"Agent 3 失败，错误信息: {agent_3_output.error}")
+                return process_query_with_agents(query, model, rollback_agent=2)  # 回退到 Agent 2
+        else:
+            agent_4_output = agent_4_process(model, query)
+            if not agent_4_output.success or not agent_4_output.result.get("conditions"):
+                print(f"Agent 4 失败，错误信息: {agent_4_output.error}")
+                return process_query_with_agents(query, model, rollback_agent=2)  # 回退到 Agent 2
+
+    # Step 4: 调用 Agent 5 生成 SQL
+    if rollback_agent is None or rollback_agent == 4:
+        agent_5_output = agent_5_process(model, query)
+        if not agent_5_output.success or not agent_5_output.result.get("sql_query"):
+            print(f"Agent 5 失败，错误信息: {agent_5_output.error}")
+            return process_query_with_agents(query, model, rollback_agent=0)  # 回退到 Agent 3
+
+    return {"sql_query": agent_5_output.result}
+
+
+
+# 主流程
+for index, row in df.iterrows():
+    user_query = row['自然语言查询语句']
+    print(f"查询语句: {user_query}")
+    true_sql = row['对应的SQL语句']
+
+    # 记录开始时间
+    start_time = time.time()
+
+    # 查询流程：从 Agent 1 到 Agent 5
+    result = process_query_with_agents(user_query, llm)
+    if "error" in result:
+        print(f"查询失败: {result['error']}")
+        continue  # 跳过当前行，继续下一个查询
+
+    # 获取生成的 SQL
+    generated_sql = result["sql_query"]
+    print(f"生成的 SQL: {generated_sql}")
+
     # 提取关键字
-    generated_keywords = extract_keywords(llm_sql)
+    generated_keywords = extract_keywords(generated_sql)
     correct_keywords = extract_keywords(true_sql)
+
     # 计算匹配概率
     match_probability = len(set(generated_keywords) & set(correct_keywords)) / len(set(correct_keywords))
 
+    # 输出匹配情况
     print(f"Generated SQL Keywords: {generated_keywords}")
     print(f"Correct SQL Keywords: {correct_keywords}")
     print(f"Match Probability: {match_probability:.2f}")
+
+    # 记录结束时间
+    end_time = time.time()
+    print(f"处理时间: {end_time - start_time:.2f}秒")
